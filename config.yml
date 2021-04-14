@@ -1,0 +1,13 @@
+accounts:
+  - ernie.org-ro
+  - cloud-brs
+  - govcloud-prod
+skip-startup-sts-check: false
+ec2:
+  filename_tag: Name
+cache:
+    default_timeout: 1y
+    invalidate_filename: .cache_reload
+metadata:
+  account_number_filename: .account
+  region_filename: .region
