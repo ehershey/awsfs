@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -18,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"time"
 )
 
 const big_default_timeout = "5m"
@@ -352,7 +353,7 @@ func (o *s3object) Read(ctx context.Context, f fs.FileHandle, dest []byte, offse
 		log.Printf("Got error from GetObject: %v", err)
 		return nil, syscall.EIO
 	}
-	bytes_read, err := output.Body.Read(dest)
+	bytes_read, err := io.ReadFull(output.Body, dest)
 	log.Printf("Read %d bytes from s3\n", bytes_read)
 	// if err == syscall.EOF
 	if err != nil && err != io.EOF {
