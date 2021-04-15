@@ -15,6 +15,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -28,14 +30,37 @@ const big_default_timeout = "5m"
 const aws_profile = "ernie.org-ro"
 
 // TODO use config
-const aws_region = "us-east-1"
+const default_aws_region = "us-east-1"
 
 // TODO use config
 const sts_timeout = 2 * time.Second
 
 var cfg aws.Config
 
+var region_cfgs map[string]aws.Config
+
 var startTime time.Time
+
+var subdirs = [3]string{"ec2", "s3", "iam"}
+
+func (n *Ec2VolumesNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	log.Printf("Ec2VolumesNode(%v).Readdir()", n.Instance.InstanceId)
+
+	r := make([]fuse.DirEntry, 0, len(n.Instance.BlockDeviceMappings))
+
+	for _, object := range n.Instance.BlockDeviceMappings {
+		volume_id := *object.Ebs.VolumeId
+		d := fuse.DirEntry{
+			Name: volume_id,
+			Ino:  0,
+			Mode: fuse.S_IFDIR,
+		}
+		r = append(r, d)
+	}
+	n.populated = true
+	dirstream := fs.NewListDirStream(r)
+	return dirstream, 0
+}
 
 func (n *bucketDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	log.Printf("bucketDir(%v).Readdir()", n.Name)
@@ -98,7 +123,36 @@ func (n *bucketDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	}
 	n.populated = true
 	dirstream := fs.NewListDirStream(r)
-	log.Printf("created the thang\n")
+	return dirstream, 0
+}
+
+func (n *instanceDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	log.Printf("instanceDir(%v).Readdir()", n.Name)
+
+	r := make([]fuse.DirEntry, 0, 0)
+
+	d := fuse.DirEntry{
+		Name: "instance_type",
+		Ino:  0,
+		Mode: fuse.S_IFREG,
+	}
+	r = append(r, d)
+
+	d2 := fuse.DirEntry{
+		Name: "state",
+		Ino:  0,
+		Mode: fuse.S_IFREG,
+	}
+	r = append(r, d2)
+
+	vols := fuse.DirEntry{
+		Name: "volumes",
+		Ino:  0,
+		Mode: fuse.S_IFDIR,
+	}
+	r = append(r, vols)
+	n.populated = true
+	dirstream := fs.NewListDirStream(r)
 	return dirstream, 0
 }
 
@@ -108,46 +162,92 @@ func (n *rootSubdir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 	switch n.Name {
 	case "ec2":
 		return n.getEc2DirStream(ctx)
-		// return getEmptyDirStream(ctx)
 	case "s3":
 		return n.getS3DirStream(ctx)
-		// return getEmptyDirStream(ctx)
 	default:
 		return getEmptyDirStream(ctx)
 	}
 }
 
+//type awsService interface {
+//NewFromConfig(cfg)
+//}
+var regions = make([]string, 0, 0)
+
+func getRegions(ctx context.Context) ([]string, error) {
+	log.Printf("getRegions()\n")
+
+	if len(regions) == 0 {
+		client := ec2.NewFromConfig(cfg)
+
+		output, err := client.DescribeRegions(ctx, &ec2.DescribeRegionsInput{})
+		if err != nil {
+			return nil, err
+		}
+		for _, region := range output.Regions {
+			regions = append(regions, *region.RegionName)
+		}
+	}
+
+	log.Printf("returning %d regions\n", len(regions))
+	return regions, nil
+}
+
 func (n *rootSubdir) getEc2DirStream(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	r := make([]fuse.DirEntry, 0, 10)
-	//for i := 0; i < len(subdirs); i++ {
-	//d := fuse.DirEntry{
-	//Name: subdirs[i],
-	//Ino:  0,
-	//Mode: fuse.S_IFDIR,
-	//}
-	//r = append(r, d)
-	//}
+	instances := make([]ec2types.Instance, 0, 0)
+
+	regions, err := getRegions(ctx)
+	if err != nil {
+		log.Println(err)
+		return nil, syscall.EIO
+	}
+
+	for _, region := range regions {
+		fmt.Printf("region: %+v\n", region)
+
+		regionCfg, err := getRegionCfg(ctx, region)
+		client := ec2.NewFromConfig(*regionCfg)
+
+		InstanceOutput, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
+		if err != nil {
+			log.Println(err)
+			return nil, syscall.EIO
+		}
+
+		log.Printf("instances\n")
+
+		log.Printf("len(reservations): %d\n", len(InstanceOutput.Reservations))
+		for _, res := range InstanceOutput.Reservations {
+			for _, instance := range res.Instances {
+				log.Printf("len(res.intances): %d\n", len(res.Instances))
+				instances = append(instances, instance)
+				log.Printf("len(intances): %d\n", len(instances))
+			}
+		}
+	}
+
+	r := make([]fuse.DirEntry, 0, len(instances))
+	n.ec2 = ec2info{make(map[string]ec2types.Instance), time.Now(), time.Now()}
+	for _, instance := range instances {
+		n.ec2.Instances[*instance.InstanceId] = instance
+		log.Printf(*instance.InstanceId)
+		d := fuse.DirEntry{
+			Name: *instance.InstanceId,
+			Ino:  0,
+			Mode: fuse.S_IFDIR,
+		}
+		r = append(r, d)
+	}
 	dirstream := fs.NewListDirStream(r)
-	log.Printf("created the thang\n")
 	return dirstream, 0
 }
 
 func getEmptyDirStream(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	r := make([]fuse.DirEntry, 0, 10)
-	//for i := 0; i < len(subdirs); i++ {
-	//d := fuse.DirEntry{
-	//Name: subdirs[i],
-	//Ino:  0,
-	//Mode: fuse.S_IFDIR,
-	//}
-	//r = append(r, d)
-	//}
 	dirstream := fs.NewListDirStream(r)
-	log.Printf("created the thang\n")
 	return dirstream, 0
 }
 func (n *rootSubdir) getS3DirStream(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	// Create an Amazon S3 service client
 	client := s3.NewFromConfig(cfg)
 
 	output, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
@@ -162,7 +262,6 @@ func (n *rootSubdir) getS3DirStream(ctx context.Context) (fs.DirStream, syscall.
 	for _, bucket := range output.Buckets {
 		n.s3.Buckets[*bucket.Name] = bucket
 		log.Printf(*bucket.Name)
-		log.Printf(bucket.CreationDate.Format("2006-01-02 15:04:05"))
 		d := fuse.DirEntry{
 			Name: *bucket.Name,
 			Ino:  0,
@@ -171,7 +270,6 @@ func (n *rootSubdir) getS3DirStream(ctx context.Context) (fs.DirStream, syscall.
 		r = append(r, d)
 	}
 	dirstream := fs.NewListDirStream(r)
-	log.Printf("created the thang\n")
 	return dirstream, 0
 }
 
@@ -213,24 +311,91 @@ func (n *bucketDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	}
 }
 
-func (n *rootSubdir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	log.Printf("rootSubdir(%v).Lookup(%v)\n", n.Name, name)
+func (n *instanceDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	log.Printf("instanceDir(%v).Lookup(%v)\n", n.Name, name)
 
-	if n.Name == "s3" && len(n.s3.Buckets) == 0 {
-		_, errno := n.getS3DirStream(ctx)
+	log.Printf("n: %v", n)
+
+	if !n.populated {
+		log.Println("Triggering instance readdir from child lookup")
+		_, errno := n.Readdir(ctx)
 		if errno != 0 {
+			log.Println("Returning errno from child lookup readdir")
 			return nil, errno
 		}
 	}
+	log.Printf("Triggered instance readdir complete\n")
 
-	bucket, prs := n.s3.Buckets[name]
-	if !prs {
+	if name == "instance_type" {
+		ops := Ec2AttributeNode{Value: string(n.Instance.InstanceType)}
+		//ops.Resource = n.Instance
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFREG})
+		log.Println("Returning new file inode")
+		return newinode, 0
+	} else if name == "state" {
+		ops := Ec2AttributeNode{Value: string(n.Instance.State.Name)}
+		//ops.Instance = n.Instance
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFREG})
+		log.Println("Returning new file inode")
+		return newinode, 0
+	} else if name == "volumes" {
+		ops := Ec2VolumesNode{}
+		ops.Instance = n.Instance
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
+		log.Println("Returning new Ec2VolumesNode inode")
+		return newinode, 0
+	} else {
+		log.Println("Returning ENOENT")
 		return nil, syscall.ENOENT
 	}
-	ops := bucketDir{Name: name, Bucket: bucket, LoadTime: time.Now()}
-	newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
-	log.Printf("returning new bucketDir inode")
+}
+
+func (n *Ec2VolumesNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	log.Printf("Ec2VolumesNode(%v).Lookup(%v)\n", n.Instance.InstanceId, name)
+	ops := Ec2AttributeNode{Value: "something"}
+	newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFREG})
+	log.Println("Returning new file inode")
 	return newinode, 0
+}
+
+func (n *rootSubdir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	log.Printf("rootSubdir(%v).Lookup(%v)\n", n.Name, name)
+
+	if n.Name == "s3" {
+		if len(n.s3.Buckets) == 0 {
+			_, errno := n.getS3DirStream(ctx)
+			if errno != 0 {
+				return nil, errno
+			}
+		}
+
+		bucket, prs := n.s3.Buckets[name]
+		if !prs {
+			return nil, syscall.ENOENT
+		}
+		ops := bucketDir{Name: name, Bucket: bucket, LoadTime: time.Now()}
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
+		log.Printf("returning new bucketDir inode")
+		return newinode, 0
+	} else if n.Name == "ec2" {
+		if len(n.ec2.Instances) == 0 {
+			_, errno := n.getEc2DirStream(ctx)
+			if errno != 0 {
+				return nil, errno
+			}
+		}
+
+		instance, prs := n.ec2.Instances[name]
+		if !prs {
+			return nil, syscall.ENOENT
+		}
+		ops := instanceDir{Name: name, Instance: instance, LoadTime: time.Now()}
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
+		log.Printf("returning new instanceDir inode")
+		return newinode, 0
+
+	}
+	return nil, syscall.ENOENT
 }
 
 func (r *AwsRoot) OnAdd(ctx context.Context) {
@@ -263,7 +428,7 @@ func (r *AwsRoot) OnAdd(ctx context.Context) {
 
 	for _, subdir := range subdirs {
 		ch3 := r.NewPersistentInode(
-			ctx, &rootSubdir{fs.Inode{}, subdir, s3info{}, time.Now()},
+			ctx, &rootSubdir{fs.Inode{}, subdir, s3info{}, ec2info{}, time.Now()},
 			fs.StableAttr{Ino: 0,
 				Mode: fuse.S_IFDIR,
 			})
@@ -296,6 +461,55 @@ func (o *s3object) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 	out.Size = uint64(o.Object.Size)
 	log.Printf("out: %v", out)
 	return 0
+}
+
+func (o *Ec2AttributeNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	log.Printf("Ec2AttributeNode().Getattr()")
+
+	out.Mode = 0755
+	//mtime, err := time.Parse(time.RFC3339, o.Object.LastModified)
+	//if err != nil {
+	//log.Printf("Got error parsing mtime from s3: %v", err)
+	//return syscall.EIO
+	//}
+
+	parentName, parentInode := o.Parent()
+	log.Printf("parentName: %v\n", parentName)
+	log.Printf("parentInode: %v\n", parentInode)
+
+	out.Mtime = uint64(time.Now().Unix())
+	out.Ctime = uint64(time.Now().Unix())
+	out.Atime = uint64(time.Now().Unix())
+	out.Size = uint64(len(o.Value))
+	log.Printf("out: %v", out)
+	return 0
+}
+
+func (o *Ec2AttributeNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	log.Printf("Ec2AttributeNode().Open()\n")
+	fmt.Printf("flags: %d / %b\n", flags, flags)
+	fmt.Printf("syscall.O_APPEND: %d / %b\n", syscall.O_APPEND, syscall.O_APPEND)
+	fmt.Printf("syscall.O_CREAT: %d / %b\n", syscall.O_CREAT, syscall.O_CREAT)
+	fmt.Printf("syscall.O_RDWR: %d / %b\n", syscall.O_RDWR, syscall.O_RDWR)
+	fmt.Printf("flags & syscall.O_RDWR: %d / %b\n", flags&syscall.O_RDWR, flags&syscall.O_RDWR)
+
+	// only support read = flags == 0
+	if flags == 0 {
+		fh := NewFileHandle()
+		return fh, 0, 0
+	}
+	return nil, 0, syscall.EROFS
+}
+
+func (o *Ec2AttributeNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, offset int64) (fuse.ReadResult, syscall.Errno) {
+	log.Printf("Ec2AttributeNode().Read()\n")
+	fmt.Printf("f: %d\n", f)
+	fmt.Printf("len(dest): %v\n", len(dest))
+	fmt.Printf("offset: %v\n", offset)
+	fmt.Printf("o.Value: %v\n", o.Value)
+
+	copy(dest, o.Value)
+	return fuse.ReadResultData(dest), 0
 }
 
 func (o *s3object) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
@@ -374,6 +588,16 @@ func (r *bucketDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Att
 	return 0
 }
 
+func (r *instanceDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	log.Printf("instanceDir(%v).Getattr()", r.Name)
+	out.Mode = 0755
+	out.Mtime = uint64(r.LoadTime.Unix())
+	out.Ctime = uint64(r.Instance.LaunchTime.Unix())
+	out.Atime = uint64(r.Instance.LaunchTime.Unix())
+	log.Printf("out: %v", out)
+	return 0
+}
+
 func (r *AwsRoot) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = 0755
 	return 0
@@ -432,13 +656,18 @@ func waitforint(server *fuse.Server, c chan os.Signal) {
 	waitforint(server, c)
 }
 
+// populate default region config object. Other region configs can be used and accessed
+// by calling getRegionCfg(ctx, region)
 func initaws() (err error) {
+
 	// Load the Shared AWS Configuration (~/.aws/config)
 	// ctx := context.Background()
 	ctx, cancelfunc := context.WithTimeout(context.Background(), sts_timeout)
 	defer cancelfunc()
-	cfg, err = config.LoadDefaultConfig(ctx, config.WithRegion(aws_region),
-		config.WithSharedConfigProfile(aws_profile))
+	var default_region_cfg *aws.Config
+	default_region_cfg, err = getRegionCfg(ctx, default_aws_region)
+
+	cfg = *default_region_cfg
 
 	if err != nil {
 		return fmt.Errorf("Cannot load AWS configuration: %w", err)
@@ -449,4 +678,17 @@ func initaws() (err error) {
 		return fmt.Errorf("Cannot authenticate to AWS: %w", err)
 	}
 	return
+}
+
+func getRegionCfg(ctx context.Context, region string) (*aws.Config, error) {
+	if regionCfg, prs := region_cfgs[region]; prs {
+		return &regionCfg, nil
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region),
+		config.WithSharedConfigProfile(aws_profile))
+
+	if err != nil {
+		return nil, fmt.Errorf("Cannot load AWS configuration: %w", err)
+	}
+	return &cfg, nil
 }
