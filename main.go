@@ -83,6 +83,7 @@ func (r *ec2TagsDir) OnAdd(ctx context.Context) {
 }
 
 func (n *ec2TagsDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	log.Printf("returning len(n.Children()) children: %d\n", len(n.Children()))
 	return getExistingDirStream(n.Children())
 }
 func (n *Ec2VolumesNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -224,7 +225,14 @@ func (n *instanceDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno)
 		Ino:  0,
 		Mode: fuse.S_IFDIR,
 	}
+
 	r = append(r, vols)
+	tags := fuse.DirEntry{
+		Name: "tags",
+		Ino:  0,
+		Mode: fuse.S_IFDIR,
+	}
+	r = append(r, tags)
 	n.populated = true
 	dirstream := fs.NewListDirStream(r)
 	return dirstream, 0
@@ -236,6 +244,7 @@ func (n *rootSubdir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 	// maybe change to type switch somehow?
 	switch n.Name {
 	case "ec2":
+		log.Printf("returning len(n.Children()) children: %d\n", len(n.Children()))
 		return getExistingDirStream(n.Children())
 	case "s3":
 		return n.getS3DirStream(ctx)
@@ -244,6 +253,8 @@ func (n *rootSubdir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 	}
 }
 
+// can only be used for OnAdd static children otherwise they get forgotten
+//
 func getExistingDirStream(kids map[string]*fs.Inode) (fs.DirStream, syscall.Errno) {
 	//log.Printf("%v\n", n.ec2)
 	r := make([]fuse.DirEntry, 0, len(kids))
@@ -292,7 +303,18 @@ func (n *ec2Subdir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 	if n.Name == "i" {
 		if n.instances.populated {
-			return getExistingDirStream(n.Children())
+			instancemap := n.instances.Instances
+			r := make([]fuse.DirEntry, 0, len(instancemap))
+			for _, instance := range instancemap {
+				d := fuse.DirEntry{
+					Name: *instance.InstanceId,
+					Ino:  0,
+					Mode: fuse.S_IFDIR,
+				}
+				r = append(r, d)
+			}
+			dirstream := fs.NewListDirStream(r)
+			return dirstream, 0
 		}
 
 		instances := make([]ec2types.Instance, 0, 0)
@@ -339,7 +361,18 @@ func (n *ec2Subdir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		return dirstream, 0
 	} else if n.Name == "v" {
 		if n.volumes.populated {
-			return getExistingDirStream(n.Children())
+			volumemap := n.volumes.Volumes
+			r := make([]fuse.DirEntry, 0, len(volumemap))
+			for _, volume := range volumemap {
+				d := fuse.DirEntry{
+					Name: *volume.VolumeId,
+					Ino:  0,
+					Mode: fuse.S_IFDIR,
+				}
+				r = append(r, d)
+			}
+			dirstream := fs.NewListDirStream(r)
+			return dirstream, 0
 		}
 
 		volumes := make([]ec2types.Volume, 0, 0)
