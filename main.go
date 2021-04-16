@@ -1,5 +1,23 @@
 package main
 
+/*
+ types:
+ AwsRoot - the mounted filesystem root
+ - rootSubdir - roughly 1:1 to aws service - ec2, s3, iam, etc
+   - bucketDir - one for each bucket
+     - bucketDir - artificial glue directory representing common prefix
+     - s3object - s3 object
+   - ec2Subdir - i for instances, v for volumes, vpc for vpc, snap for snapshots
+	   - instanceDir
+		   - Ec2AttributeNode - simple file containing attribute value
+			 - Ec2VolumesNode - directory of attached volumes
+			   - Ec2AttachedVolume
+	   - volumeDir
+	   - vpcDir
+	   - snapshotDir
+   - iamSubdir - users, groups, policies, roles
+*/
+
 import (
 	"context"
 	"flag"
@@ -43,6 +61,30 @@ var startTime time.Time
 
 var subdirs = [3]string{"ec2", "s3", "iam"}
 
+func (r *ec2TagsDir) OnAdd(ctx context.Context) {
+	log.Printf("ec2TagsDir().OnAdd()\n")
+
+	for _, tag := range r.tags {
+
+		key := tag.Key
+		value := fmt.Sprintf("%s\n", *tag.Value)
+
+		child := r.NewPersistentInode(ctx, &fs.MemRegularFile{
+			Data: []byte(value),
+			Attr: fuse.Attr{
+				Mode:  0644,
+				Mtime: uint64(time.Now().Unix()),
+				Ctime: uint64(time.Now().Unix()),
+				Atime: uint64(time.Now().Unix()),
+			}}, fs.StableAttr{Ino: 0})
+		r.AddChild(*key, child, false)
+	}
+	return
+}
+
+func (n *ec2TagsDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	return getExistingDirStream(n.Children())
+}
 func (n *Ec2VolumesNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	log.Printf("Ec2VolumesNode(%v).Readdir()", n.Instance.InstanceId)
 
@@ -126,6 +168,38 @@ func (n *bucketDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	return dirstream, 0
 }
 
+func (n *volumeDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	log.Printf("volumeDir(%v).Readdir()", n.Name)
+
+	r := make([]fuse.DirEntry, 0, 0)
+
+	d := fuse.DirEntry{
+		Name: "volume_type",
+		Ino:  0,
+		Mode: fuse.S_IFREG,
+	}
+	r = append(r, d)
+
+	d2 := fuse.DirEntry{
+		Name: "state",
+		Ino:  0,
+		Mode: fuse.S_IFREG,
+	}
+
+	r = append(r, d2)
+
+	d3 := fuse.DirEntry{
+		Name: "tags",
+		Ino:  0,
+		Mode: fuse.S_IFREG,
+	}
+	r = append(r, d3)
+
+	n.populated = true
+	dirstream := fs.NewListDirStream(r)
+	return dirstream, 0
+}
+
 func (n *instanceDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	log.Printf("instanceDir(%v).Readdir()", n.Name)
 
@@ -159,14 +233,29 @@ func (n *instanceDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno)
 func (n *rootSubdir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	log.Printf("rootSubdir(%v).Readdir()", n.Name)
 
+	// maybe change to type switch somehow?
 	switch n.Name {
 	case "ec2":
-		return n.getEc2DirStream(ctx)
+		return getExistingDirStream(n.Children())
 	case "s3":
 		return n.getS3DirStream(ctx)
 	default:
 		return getEmptyDirStream(ctx)
 	}
+}
+
+func getExistingDirStream(kids map[string]*fs.Inode) (fs.DirStream, syscall.Errno) {
+	//log.Printf("%v\n", n.ec2)
+	r := make([]fuse.DirEntry, 0, len(kids))
+	for name, child := range kids {
+		child_direntry := fuse.DirEntry{
+			Name: name,
+			Ino:  child.StableAttr().Ino,
+			Mode: fuse.S_IFDIR,
+		}
+		r = append(r, child_direntry)
+	}
+	return fs.NewListDirStream(r), 0
 }
 
 //type awsService interface {
@@ -193,53 +282,108 @@ func getRegions(ctx context.Context) ([]string, error) {
 	return regions, nil
 }
 
-func (n *rootSubdir) getEc2DirStream(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	instances := make([]ec2types.Instance, 0, 0)
-
+func (n *ec2Subdir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	log.Printf("ec2Subdir(%v).Readdir()\n", n.Name)
 	regions, err := getRegions(ctx)
 	if err != nil {
 		log.Println(err)
 		return nil, syscall.EIO
 	}
 
-	for _, region := range regions {
-		fmt.Printf("region: %+v\n", region)
-
-		regionCfg, err := getRegionCfg(ctx, region)
-		client := ec2.NewFromConfig(*regionCfg)
-
-		InstanceOutput, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
-		if err != nil {
-			log.Println(err)
-			return nil, syscall.EIO
+	if n.Name == "i" {
+		if n.instances.populated {
+			return getExistingDirStream(n.Children())
 		}
 
-		log.Printf("instances\n")
+		instances := make([]ec2types.Instance, 0, 0)
 
-		log.Printf("len(reservations): %d\n", len(InstanceOutput.Reservations))
-		for _, res := range InstanceOutput.Reservations {
-			for _, instance := range res.Instances {
-				log.Printf("len(res.intances): %d\n", len(res.Instances))
-				instances = append(instances, instance)
-				log.Printf("len(intances): %d\n", len(instances))
+		for _, region := range regions {
+			fmt.Printf("region: %+v\n", region)
+
+			regionCfg, err := getRegionCfg(ctx, region)
+			client := ec2.NewFromConfig(*regionCfg)
+
+			InstanceOutput, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
+			if err != nil {
+				log.Println(err)
+				return nil, syscall.EIO
+			}
+
+			log.Printf("instances\n")
+
+			log.Printf("len(reservations): %d\n", len(InstanceOutput.Reservations))
+			for _, res := range InstanceOutput.Reservations {
+				for _, instance := range res.Instances {
+					log.Printf("len(res.instances): %d\n", len(res.Instances))
+					instances = append(instances, instance)
+					log.Printf("len(instances): %d\n", len(instances))
+				}
 			}
 		}
-	}
 
-	r := make([]fuse.DirEntry, 0, len(instances))
-	n.ec2 = ec2info{make(map[string]ec2types.Instance), time.Now(), time.Now()}
-	for _, instance := range instances {
-		n.ec2.Instances[*instance.InstanceId] = instance
-		log.Printf(*instance.InstanceId)
-		d := fuse.DirEntry{
-			Name: *instance.InstanceId,
-			Ino:  0,
-			Mode: fuse.S_IFDIR,
+		r := make([]fuse.DirEntry, 0, len(instances))
+		instancemap := make(map[string]ec2types.Instance)
+		for _, instance := range instances {
+			instancemap[*instance.InstanceId] = instance
+			log.Printf(*instance.InstanceId)
+			d := fuse.DirEntry{
+				Name: *instance.InstanceId,
+				Ino:  0,
+				Mode: fuse.S_IFDIR,
+			}
+			r = append(r, d)
 		}
-		r = append(r, d)
+		n.instances.Instances = instancemap
+		n.instances.populated = true
+		dirstream := fs.NewListDirStream(r)
+		return dirstream, 0
+	} else if n.Name == "v" {
+		if n.volumes.populated {
+			return getExistingDirStream(n.Children())
+		}
+
+		volumes := make([]ec2types.Volume, 0, 0)
+
+		for _, region := range regions {
+			fmt.Printf("region: %+v\n", region)
+
+			regionCfg, err := getRegionCfg(ctx, region)
+			client := ec2.NewFromConfig(*regionCfg)
+
+			volumeOutput, err := client.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{})
+			if err != nil {
+				log.Println(err)
+				return nil, syscall.EIO
+			}
+
+			log.Printf("volumes\n")
+
+			log.Printf("len(volumes): %d\n", len(volumeOutput.Volumes))
+			for _, volume := range volumeOutput.Volumes {
+				log.Printf("len(volumeOutput.volumes): %d\n", len(volumeOutput.Volumes))
+				volumes = append(volumes, volume)
+				log.Printf("len(volumes): %d\n", len(volumes))
+			}
+		}
+
+		r := make([]fuse.DirEntry, 0, len(volumes))
+		volumemap := make(map[string]ec2types.Volume)
+		for _, volume := range volumes {
+			volumemap[*volume.VolumeId] = volume
+			log.Printf(*volume.VolumeId)
+			d := fuse.DirEntry{
+				Name: *volume.VolumeId,
+				Ino:  0,
+				Mode: fuse.S_IFDIR,
+			}
+			r = append(r, d)
+		}
+		n.volumes.Volumes = volumemap
+		n.volumes.populated = true
+		dirstream := fs.NewListDirStream(r)
+		return dirstream, 0
 	}
-	dirstream := fs.NewListDirStream(r)
-	return dirstream, 0
+	return nil, syscall.ENOENT
 }
 
 func getEmptyDirStream(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -247,6 +391,7 @@ func getEmptyDirStream(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	dirstream := fs.NewListDirStream(r)
 	return dirstream, 0
 }
+
 func (n *rootSubdir) getS3DirStream(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	client := s3.NewFromConfig(cfg)
 
@@ -301,7 +446,7 @@ func (n *bucketDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 		log.Println("Returning new file inode")
 		return newinode, 0
 	} else if n.subprefixes[name] {
-		ops := bucketDir{Name: name, Bucket: n.Bucket, LoadTime: time.Now()}
+		ops := bucketDir{Name: name, Bucket: n.Bucket, loadTime: time.Now()}
 		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
 		log.Println("Returning new bucketdir inode")
 		return newinode, 0
@@ -327,22 +472,65 @@ func (n *instanceDir) Lookup(ctx context.Context, name string, out *fuse.EntryOu
 	log.Printf("Triggered instance readdir complete\n")
 
 	if name == "instance_type" {
-		ops := Ec2AttributeNode{Value: string(n.Instance.InstanceType)}
+		ops := Ec2AttributeNode{Value: fmt.Sprintf("%v\n", n.Instance.InstanceType)}
 		//ops.Resource = n.Instance
 		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFREG})
 		log.Println("Returning new file inode")
 		return newinode, 0
 	} else if name == "state" {
-		ops := Ec2AttributeNode{Value: string(n.Instance.State.Name)}
+		ops := Ec2AttributeNode{Value: fmt.Sprintf("%v\n", n.Instance.State.Name)}
 		//ops.Instance = n.Instance
 		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFREG})
 		log.Println("Returning new file inode")
+		return newinode, 0
+	} else if name == "tags" {
+		ops := ec2TagsDir{}
+		ops.tags = n.Instance.Tags
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
+		log.Println("Returning new ec2TagsDir inode")
 		return newinode, 0
 	} else if name == "volumes" {
 		ops := Ec2VolumesNode{}
 		ops.Instance = n.Instance
 		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
 		log.Println("Returning new Ec2VolumesNode inode")
+		return newinode, 0
+	} else {
+		log.Println("Returning ENOENT")
+		return nil, syscall.ENOENT
+	}
+}
+
+func (n *volumeDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	log.Printf("volumeDir(%v).Lookup(%v)\n", n.Name, name)
+
+	log.Printf("n: %v", n)
+
+	if !n.populated {
+		log.Println("Triggering volume readdir from child lookup")
+		_, errno := n.Readdir(ctx)
+		if errno != 0 {
+			log.Println("Returning errno from child lookup readdir")
+			return nil, errno
+		}
+	}
+	log.Printf("Triggered volume readdir complete\n")
+
+	if name == "volume_type" {
+		ops := Ec2AttributeNode{Value: fmt.Sprintf("%v\n", n.Volume.VolumeType)}
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFREG})
+		log.Println("Returning new file inode")
+		return newinode, 0
+	} else if name == "state" {
+		ops := Ec2AttributeNode{Value: fmt.Sprintf("%v\n", n.Volume.State)}
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFREG})
+		log.Println("Returning new file inode")
+		return newinode, 0
+	} else if name == "tags" {
+		ops := ec2TagsDir{}
+		ops.tags = n.Volume.Tags
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
+		log.Println("Returning new ec2TagsDir inode")
 		return newinode, 0
 	} else {
 		log.Println("Returning ENOENT")
@@ -357,7 +545,10 @@ func (n *Ec2VolumesNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 	log.Println("Returning new file inode")
 	return newinode, 0
 }
-
+func (n *ec2TagsDir) Lookup(cts context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	var newinode = n.Children()[name]
+	return newinode, 0
+}
 func (n *rootSubdir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	log.Printf("rootSubdir(%v).Lookup(%v)\n", n.Name, name)
 
@@ -373,33 +564,78 @@ func (n *rootSubdir) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		if !prs {
 			return nil, syscall.ENOENT
 		}
-		ops := bucketDir{Name: name, Bucket: bucket, LoadTime: time.Now()}
+		ops := bucketDir{Name: name, Bucket: bucket, loadTime: time.Now()}
 		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
 		log.Printf("returning new bucketDir inode")
 		return newinode, 0
 	} else if n.Name == "ec2" {
-		if len(n.ec2.Instances) == 0 {
-			_, errno := n.getEc2DirStream(ctx)
+
+		var newinode = n.Children()[name]
+		return newinode, 0
+	}
+	return nil, syscall.ENOENT
+}
+
+func (r *rootSubdir) OnAdd(ctx context.Context) {
+	log.Printf("rootSubdir(%v).OnAdd()", r.Name)
+
+	ec2subdirs := []string{"i", "v", "vpc", "snapshot"}
+
+	if r.Name == "ec2" {
+		for _, subdir := range ec2subdirs {
+			child := r.NewPersistentInode(
+				ctx, &ec2Subdir{fs.Inode{}, subdir, instanceinfo{}, volumeinfo{}, vpcinfo{}, snapshotinfo{}, time.Now()},
+				fs.StableAttr{Ino: 0,
+					Mode: fuse.S_IFDIR,
+				})
+			r.AddChild(subdir, child, false)
+		}
+	}
+	return
+}
+
+func (n *ec2Subdir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	log.Printf("ec2Subdir(%v).Lookup(%v)\n", n.Name, name)
+
+	if n.Name == "i" {
+		if !n.instances.populated {
+			_, errno := n.Readdir(ctx)
 			if errno != 0 {
 				return nil, errno
 			}
 		}
 
-		instance, prs := n.ec2.Instances[name]
+		instance, prs := n.instances.Instances[name]
 		if !prs {
 			return nil, syscall.ENOENT
 		}
-		ops := instanceDir{Name: name, Instance: instance, LoadTime: time.Now()}
+		ops := instanceDir{Name: name, Instance: instance, loadTime: time.Now()}
 		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
 		log.Printf("returning new instanceDir inode")
 		return newinode, 0
+	} else if n.Name == "v" {
+		if len(n.volumes.Volumes) == 0 {
+			_, errno := n.Readdir(ctx)
+			if errno != 0 {
+				return nil, errno
+			}
+		}
 
+		volume, prs := n.volumes.Volumes[name]
+		if !prs {
+			return nil, syscall.ENOENT
+		}
+		ops := volumeDir{Name: name, Volume: volume, loadTime: time.Now()}
+		newinode := n.NewInode(ctx, &ops, fs.StableAttr{Mode: syscall.S_IFDIR})
+		log.Printf("returning new volumeDir inode")
+		return newinode, 0
 	}
+
 	return nil, syscall.ENOENT
 }
 
 func (r *AwsRoot) OnAdd(ctx context.Context) {
-	log.Println("OnAdd()")
+	log.Println("AwsRoot.OnAdd()")
 
 	ch := r.NewPersistentInode(
 		ctx, &fs.MemRegularFile{
@@ -427,44 +663,37 @@ func (r *AwsRoot) OnAdd(ctx context.Context) {
 	r.AddChild("file2.txt", ch2, false)
 
 	for _, subdir := range subdirs {
-		ch3 := r.NewPersistentInode(
+		child := r.NewPersistentInode(
 			ctx, &rootSubdir{fs.Inode{}, subdir, s3info{}, ec2info{}, time.Now()},
 			fs.StableAttr{Ino: 0,
 				Mode: fuse.S_IFDIR,
 			})
-		r.AddChild(subdir, ch3, false)
+		r.AddChild(subdir, child, false)
 	}
 }
 
+func (r *volumeDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	return getBoringAttr(r, getLoadTime(r), out)
+}
+
+func (r *ec2TagsDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	return getBoringAttr(r, getLoadTime(r), out)
+}
+
 func (r *rootSubdir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	log.Printf("rootSubdir(%v).Getattr()", r.Name)
-	out.Mode = 0755
-	out.Mtime = uint64(r.LoadTime.Unix())
-	out.Ctime = uint64(r.LoadTime.Unix())
-	out.Atime = uint64(r.LoadTime.Unix())
-	log.Printf("out.Mtime: %d", out.Mtime)
-	return 0
+	return getBoringAttr(r, getLoadTime(r), out)
 }
 
 func (o *s3object) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	log.Printf("s3object(%v).Getattr()", o.Name)
-
-	out.Mode = 0755
-	//mtime, err := time.Parse(time.RFC3339, o.Object.LastModified)
-	//if err != nil {
-	//log.Printf("Got error parsing mtime from s3: %v", err)
-	//return syscall.EIO
-	//}
-	out.Mtime = uint64(o.Object.LastModified.Unix())
-	out.Ctime = uint64(o.Object.LastModified.Unix())
-	out.Atime = uint64(o.Object.LastModified.Unix())
+	if res := getBoringAttr(o, *o.Object.LastModified, out); res != 0 {
+		return res
+	}
 	out.Size = uint64(o.Object.Size)
-	log.Printf("out: %v", out)
 	return 0
 }
 
 func (o *Ec2AttributeNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	log.Printf("Ec2AttributeNode().Getattr()")
+	//log.Printf("Ec2AttributeNode().Getattr()")
 
 	out.Mode = 0755
 	//mtime, err := time.Parse(time.RFC3339, o.Object.LastModified)
@@ -481,7 +710,7 @@ func (o *Ec2AttributeNode) Getattr(ctx context.Context, fh fs.FileHandle, out *f
 	out.Ctime = uint64(time.Now().Unix())
 	out.Atime = uint64(time.Now().Unix())
 	out.Size = uint64(len(o.Value))
-	log.Printf("out: %v", out)
+	//log.Printf("out: %v", out)
 	return 0
 }
 
@@ -579,22 +808,47 @@ func (o *s3object) Read(ctx context.Context, f fs.FileHandle, dest []byte, offse
 }
 
 func (r *bucketDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	log.Printf("bucketDir(%v).Getattr()", r.Name)
-	out.Mode = 0755
-	out.Mtime = uint64(r.LoadTime.Unix())
-	out.Ctime = uint64(r.Bucket.CreationDate.Unix())
-	out.Atime = uint64(r.Bucket.CreationDate.Unix())
-	log.Printf("out: %v", out)
-	return 0
+	return getBoringAttr(r, *r.Bucket.CreationDate, out)
 }
 
 func (r *instanceDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	log.Printf("instanceDir(%v).Getattr()", r.Name)
+	return getBoringAttr(r, *r.Instance.LaunchTime, out)
+}
+
+type awsfsNode interface {
+	LoadTime() time.Time
+}
+
+func (r *s3object) LoadTime() time.Time {
+	return r.loadTime
+}
+
+func (r *ec2TagsDir) LoadTime() time.Time {
+	return r.loadTime
+}
+
+func (r *volumeDir) LoadTime() time.Time {
+	return r.loadTime
+}
+
+func (r *instanceDir) LoadTime() time.Time {
+	return r.loadTime
+}
+func (r *rootSubdir) LoadTime() time.Time {
+	return r.loadTime
+}
+func (r *bucketDir) LoadTime() time.Time {
+	return r.loadTime
+}
+func getLoadTime(node awsfsNode) time.Time {
+	return node.LoadTime()
+}
+
+func getBoringAttr(node awsfsNode, ctime time.Time, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = 0755
-	out.Mtime = uint64(r.LoadTime.Unix())
-	out.Ctime = uint64(r.Instance.LaunchTime.Unix())
-	out.Atime = uint64(r.Instance.LaunchTime.Unix())
-	log.Printf("out: %v", out)
+	out.Mtime = uint64(node.LoadTime().Unix())
+	out.Ctime = uint64(ctime.Unix())
+	out.Atime = uint64(ctime.Unix())
 	return 0
 }
 
